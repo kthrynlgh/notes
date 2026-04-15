@@ -1,23 +1,40 @@
-// ── Storage ────────────────────────────────────────────────────────────────
-const STORAGE_KEY = 'corkboard_notes_v2';
+// ── API ────────────────────────────────────────────────────────────────────
+const API = '/Notes';
 
-function loadNotes() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
-  catch { return []; }
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API}${path}`, options);
+  if (!options.skipJson && res.status !== 204) return await res.json();
+  return null;
 }
 
-function saveNotes() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
+async function apiGetAll() {
+  return await apiFetch('/') || [];
+}
+
+async function apiCreate(payload) {
+  return await apiFetch('/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function apiUpdate(id, payload) {
+  return await apiFetch(`/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function apiDelete(id) {
+  await apiFetch(`/${id}`, { method: 'DELETE', skipJson: true });
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
-let notes = loadNotes();
+let notes = [];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-}
-
 function randomPos() {
   const board = document.getElementById('board');
   const w = board.clientWidth;
@@ -32,7 +49,7 @@ function randomPos() {
 }
 
 function randomRotation() {
-  return (Math.random() - 0.5) * 8; // −4° to +4°
+  return (Math.random() - 0.5) * 8;
 }
 
 const NOTE_COLORS = 6;
@@ -69,18 +86,24 @@ function createNoteElement(note, isNew = false) {
 
   el.innerHTML = `
     <div class="pin"></div>
-    <textarea class="note-content" placeholder="Write something…">${escHtml(note.text)}</textarea>
+    <textarea class="note-content" placeholder="Write something…">${escHtml(note.text || '')}</textarea>
     <div class="note-footer">
       <button class="delete-btn" title="Delete note">✕</button>
     </div>
   `;
 
-  // Text changes
+  // Text changes — debounced so we don't spam the API on every keystroke
   const ta = el.querySelector('.note-content');
+  let debounceTimer;
   ta.addEventListener('input', () => {
-    updateNote(note.id, { text: ta.value });
+    note.text = ta.value;
+    renderSidebar();
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      apiUpdate(note.id, noteToPayload(note));
+    }, 600);
   });
-  // Prevent drag when interacting with textarea
+
   ta.addEventListener('mousedown',  e => e.stopPropagation());
   ta.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
 
@@ -113,14 +136,14 @@ function renderSidebar() {
     item.className = 'list-item';
     item.dataset.id = note.id;
 
-    const lines = note.text.trim().split('\n');
+    const lines = (note.text || '').trim().split('\n');
     const title   = lines[0] || '(empty)';
     const preview = lines.slice(1).join(' ').trim();
 
     item.innerHTML = `
       <span class="li-title">${escHtml(title.slice(0, 40))}</span>
       <span class="li-preview">${escHtml(preview.slice(0, 50) || '—')}</span>
-      <span class="color-chip" style="background:${colorBgs[note.color]}; border: 1.5px solid rgba(0,0,0,0.1);"></span>
+      <span class="color-chip" style="background:${colorBgs[note.color] || colorBgs[0]}; border: 1.5px solid rgba(0,0,0,0.1);"></span>
     `;
 
     item.addEventListener('click', () => focusNote(note.id));
@@ -135,20 +158,54 @@ function updateCount() {
   if (el) el.textContent = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
 }
 
-// ── CRUD ───────────────────────────────────────────────────────────────────
-function addNote() {
-  const pos = randomPos();
-  const note = {
-    id:        uid(),
-    text:      '',
-    x:         pos.x,
-    y:         pos.y,
-    rotation:  randomRotation(),
-    color:     Math.floor(Math.random() * NOTE_COLORS),
-    createdAt: Date.now(),
+// ── Map between local note shape and API payload ───────────────────────────
+// The API stores: title, content, x, y, rotation, color
+// Locally we use: text (combines title+content), x, y, rotation, color
+// Strategy: first line of text = title, rest = content
+
+function noteToPayload(note) {
+  const lines = (note.text || '').split('\n');
+  return {
+    title:    lines[0] || '(empty)',
+    content:  lines.slice(1).join('\n') || '',
+    x:        Math.round(note.x),
+    y:        Math.round(note.y),
+    rotation: note.rotation,
+    color:    note.color,
   };
+}
+
+function payloadToNote(data) {
+  const text = data.content
+    ? `${data.title}\n${data.content}`
+    : data.title === '(empty)' ? '' : data.title;
+  return {
+    id:       data.id,
+    text:     text,
+    x:        data.x ?? randomPos().x,
+    y:        data.y ?? randomPos().y,
+    rotation: data.rotation ?? randomRotation(),
+    color:    data.color ?? Math.floor(Math.random() * NOTE_COLORS),
+  };
+}
+
+// ── CRUD ───────────────────────────────────────────────────────────────────
+async function addNote() {
+  const pos = randomPos();
+  const draft = {
+    text:     '',
+    x:        pos.x,
+    y:        pos.y,
+    rotation: randomRotation(),
+    color:    Math.floor(Math.random() * NOTE_COLORS),
+  };
+
+  // Save to API first to get a real ID
+  const saved = await apiCreate(noteToPayload(draft));
+  if (!saved) return;
+
+  const note = payloadToNote(saved);
   notes.push(note);
-  saveNotes();
 
   const board = document.getElementById('board');
   document.getElementById('empty').style.display = 'none';
@@ -157,30 +214,22 @@ function addNote() {
 
   renderSidebar();
 
-  // Remove animation class after it finishes, then focus
   el.addEventListener('animationend', () => {
     el.classList.remove('new-note');
     el.querySelector('.note-content').focus();
   }, { once: true });
 }
 
-function updateNote(id, changes) {
-  const note = notes.find(n => n.id === id);
-  if (!note) return;
-  Object.assign(note, changes);
-  saveNotes();
-  renderSidebar();
-}
-
-function removeNote(id, el) {
-  // Quick scale-out animation
+async function removeNote(id, el) {
   el.style.transition = 'transform 0.18s ease, opacity 0.18s ease';
   el.style.transform  = `scale(0.7) rotate(${Math.random() * 20 - 10}deg)`;
   el.style.opacity    = '0';
+
+  await apiDelete(id);
+
   setTimeout(() => {
     el.remove();
     notes = notes.filter(n => n.id !== id);
-    saveNotes();
     if (!notes.length) document.getElementById('empty').style.display = 'block';
     renderSidebar();
   }, 180);
@@ -189,7 +238,6 @@ function removeNote(id, el) {
 function focusNote(id) {
   const el = document.querySelector(`.note[data-id="${id}"]`);
   if (!el) return;
-  // Temporarily pop to top
   el.style.zIndex = '50';
   el.style.transition = 'box-shadow 0.2s';
   el.style.boxShadow = '0 12px 40px rgba(0,0,0,0.22)';
@@ -199,7 +247,6 @@ function focusNote(id) {
   }, 900);
   el.querySelector('.note-content').focus();
 
-  // Highlight sidebar item
   document.querySelectorAll('.list-item').forEach(i => i.classList.remove('active'));
   const li = document.querySelector(`.list-item[data-id="${id}"]`);
   if (li) li.classList.add('active');
@@ -236,7 +283,8 @@ function makeDraggable(el, note) {
     if (!dragging) return;
     dragging = false;
     el.classList.remove('dragging');
-    saveNotes();
+    // Save new position to API
+    apiUpdate(note.id, noteToPayload(note));
   }
 
   el.addEventListener('mousedown',  onDown);
@@ -248,5 +296,16 @@ function makeDraggable(el, note) {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
-document.getElementById('add-btn').addEventListener('click', addNote);
-renderAll();
+async function init() {
+  document.getElementById('add-btn').addEventListener('click', addNote);
+  try {
+    const data = await apiGetAll();
+    notes = data.map(payloadToNote);
+  } catch (err) {
+    console.error('Failed to load notes from API:', err);
+    notes = [];
+  }
+  renderAll();
+}
+
+init();
